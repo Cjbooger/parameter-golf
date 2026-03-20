@@ -17,6 +17,7 @@ import uuid
 import zlib
 from collections.abc import Callable
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import sentencepiece as spm
@@ -56,6 +57,7 @@ class Hyperparameters:
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
+    eval_seq_len: int = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
@@ -153,7 +155,7 @@ def token_chunks(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> list
 
 
 def accumulate_flat_grads(
-    accum: dict[str, mx.array] | None,
+    accum: Optional[dict[str, mx.array]],
     grads_tree: dict,
     scale: float,
 ) -> dict[str, mx.array]:
@@ -216,7 +218,7 @@ class TokenStream:
     def __init__(
         self,
         pattern: str,
-        log_fn: Callable[[str], None] | None = None,
+        log_fn: Optional[Callable[[str], None]] = None,
         dataset_name: str = "",
     ):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
@@ -258,7 +260,7 @@ class TokenLoader:
     def __init__(
         self,
         pattern: str,
-        log_fn: Callable[[str], None] | None = None,
+        log_fn: Optional[Callable[[str], None]] = None,
         dataset_name: str = "",
     ):
         self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
@@ -689,7 +691,7 @@ def build_sentencepiece_luts(
     return base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
 
 
-def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
+def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, Optional[int]]:
     # The shard directory and tokenizer are coupled: val_bpb is only meaningful if we
     # decode bytes with the exact tokenizer that produced the shards. The manifest
     # lets the training script fail fast on accidental dataset/tokenizer mismatches.
@@ -726,12 +728,16 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def load_validation_tokens(pattern: str, seq_len: Optional[int] = None) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
+    if tokens.size <= 1:
+        raise ValueError("Validation split is too short to score")
+    if seq_len is None:
+        return tokens
     usable = ((tokens.size - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -746,7 +752,7 @@ def loss_and_grad_chunked(
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
     loss_value = mx.array(0.0, dtype=mx.float32)
-    grad_accum: dict[str, mx.array] | None = None
+    grad_accum: Optional[dict[str, mx.array]] = None
     for chunk_tokens in chunk_sizes:
         x, y = train_loader.next_batch(chunk_tokens, args.train_seq_len)
         loss, grads = compiled_loss_and_grad(x, y)
@@ -765,7 +771,7 @@ def eval_val(
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
-    log_fn: Callable[[str], None] | None = None,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -808,6 +814,160 @@ def eval_val(
             batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
         ):
             log_fn(f"val_progress:{batch_idx}/{total_batches}")
+    val_loss = total_loss_sum / total_tokens
+    bits_per_token = val_loss / math.log(2.0)
+    val_bpb = bits_per_token * (total_tokens / total_bytes)
+    return val_loss, val_bpb
+
+
+TTT_PREFIX_TOKENS = int(os.environ.get("TTT_PREFIX_TOKENS", 256))
+TTT_STEPS = int(os.environ.get("TTT_STEPS", 2))
+TTT_LR = float(os.environ.get("TTT_LR", 1e-3))
+TTT_MIN_DOC_TOKENS = int(os.environ.get("TTT_MIN_DOC_TOKENS", 64))
+TTT_ENABLED = bool(int(os.environ.get("TTT_ENABLED", "1")))
+
+
+def find_document_boundaries(
+    val_tokens: np.ndarray, is_boundary_token_lut: np.ndarray
+) -> list[tuple[int, int]]:
+    boundary_mask = is_boundary_token_lut[val_tokens.astype(np.int64, copy=False)]
+    boundary_positions = np.flatnonzero(boundary_mask).tolist()
+    if not boundary_positions:
+        return [(0, int(val_tokens.size))]
+    documents = []
+    for i, start in enumerate(boundary_positions):
+        end = boundary_positions[i + 1] if i + 1 < len(boundary_positions) else int(val_tokens.size)
+        if end - start >= 2:
+            documents.append((start, end))
+    return documents
+
+
+def clone_flat_params(flat_params: dict[str, mx.array]) -> dict[str, mx.array]:
+    return {name: mx.array(np.array(value, copy=True)) for name, value in flat_params.items()}
+
+
+def _score_token_range(
+    compiled_loss,
+    doc_tokens: np.ndarray,
+    start: int,
+    end: int,
+    seq_len: int,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    loss_sum: float,
+    token_count: float,
+    byte_count: float,
+) -> tuple[float, float, float]:
+    scorable = end - start - 1
+    if scorable <= 0:
+        return loss_sum, token_count, byte_count
+    for chunk_start in range(start, start + scorable, seq_len):
+        chunk_end = min(chunk_start + seq_len, start + scorable)
+        chunk_token_count = float(chunk_end - chunk_start)
+        x_np = doc_tokens[chunk_start:chunk_end].reshape(1, -1).astype(np.int32, copy=False)
+        y_np = doc_tokens[chunk_start + 1:chunk_end + 1].reshape(1, -1).astype(np.int32, copy=False)
+        batch_loss = compiled_loss(mx.array(x_np, dtype=mx.int32), mx.array(y_np, dtype=mx.int32)).astype(mx.float32)
+        mx.eval(batch_loss)
+        loss_sum += float(batch_loss.item()) * chunk_token_count
+        prev_ids = x_np.reshape(-1)
+        tgt_ids = y_np.reshape(-1)
+        bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
+        bytes_np += (
+            has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+        ).astype(np.int16, copy=False)
+        token_count += chunk_token_count
+        byte_count += float(bytes_np.astype(np.float64).sum())
+    return loss_sum, token_count, byte_count
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model: GPT,
+    compiled_loss,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+) -> tuple[float, float]:
+    documents = find_document_boundaries(val_tokens, is_boundary_token_lut)
+    control_params = {
+        name: value
+        for name, value in tree_flatten(model.parameters(), destination={}).items()
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    }
+    if not control_params:
+        raise ValueError("No control tensors matched CONTROL_TENSOR_NAME_PATTERNS for TTT evaluation")
+    snapshot_params = clone_flat_params(control_params)
+
+    def ttt_loss_fn(params, x, y):
+        model.update(params, strict=False)
+        return model.loss(x, y)
+
+    ttt_loss_and_grad = mx.value_and_grad(ttt_loss_fn)
+
+    total_loss_sum = 0.0
+    total_tokens = 0.0
+    total_bytes = 0.0
+    for doc_start, doc_end in documents:
+        doc_tokens = val_tokens[doc_start:doc_end]
+        doc_len = int(doc_tokens.size)
+        if doc_len < 2:
+            continue
+
+        do_ttt = (
+            TTT_ENABLED
+            and TTT_STEPS > 0
+            and TTT_PREFIX_TOKENS > 0
+            and doc_len >= TTT_MIN_DOC_TOKENS
+        )
+        prefix_len = min(TTT_PREFIX_TOKENS, doc_len - 1) if do_ttt else doc_len - 1
+
+        total_loss_sum, total_tokens, total_bytes = _score_token_range(
+            compiled_loss,
+            doc_tokens,
+            0,
+            prefix_len + 1,
+            args.eval_seq_len,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            total_loss_sum,
+            total_tokens,
+            total_bytes,
+        )
+
+        if do_ttt and prefix_len > 0:
+            x = mx.array(doc_tokens[:prefix_len].reshape(1, -1).astype(np.int32, copy=False), dtype=mx.int32)
+            y = mx.array(doc_tokens[1:prefix_len + 1].reshape(1, -1).astype(np.int32, copy=False), dtype=mx.int32)
+            for _ in range(TTT_STEPS):
+                control_tree = tree_unflatten(list(control_params.items()))
+                loss, grads = ttt_loss_and_grad(control_tree, x, y)
+                flat_grads = dict(tree_flatten(grads, destination={}))
+                for name, value in control_params.items():
+                    control_params[name] = value - TTT_LR * flat_grads[name].astype(value.dtype)
+                updated_tree = tree_unflatten(list(control_params.items()))
+                model.update(updated_tree, strict=False)
+                mx.eval(loss, updated_tree)
+
+        if prefix_len < doc_len - 1:
+            total_loss_sum, total_tokens, total_bytes = _score_token_range(
+                compiled_loss,
+                doc_tokens,
+                prefix_len,
+                doc_len,
+                args.eval_seq_len,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+                total_loss_sum,
+                total_tokens,
+                total_bytes,
+            )
+
+        control_params = clone_flat_params(snapshot_params)
+        model.update(tree_unflatten(list(control_params.items())), strict=False)
+
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
@@ -869,7 +1029,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -939,7 +1099,7 @@ def main() -> None:
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
-        f"val_batch_size:{args.val_batch_size} "
+        f"val_batch_size:{args.val_batch_size} eval_seq_len:{args.eval_seq_len} "
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
@@ -966,7 +1126,7 @@ def main() -> None:
         # Instead we run the real train shapes, force the loss/grads to materialize, and then reset
         # the loader so measured training still starts from the true init and token window.
         for warmup_step in range(args.warmup_steps):
-            accum: dict[str, mx.array] | None = None
+            accum: Optional[dict[str, mx.array]] = None
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
             for _ in range(args.grad_accum_steps):
@@ -997,7 +1157,7 @@ def main() -> None:
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    stop_after_step: int | None = None
+    stop_after_step: Optional[int] = None
     t0 = time.perf_counter()
     step = 0
     while True:
@@ -1028,7 +1188,7 @@ def main() -> None:
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
 
-        accum: dict[str, mx.array] | None = None
+        accum: Optional[dict[str, mx.array]] = None
         train_loss = mx.array(0.0, dtype=mx.float32)
         grad_scale = 1.0 / args.grad_accum_steps
         for _ in range(args.grad_accum_steps):
@@ -1086,17 +1246,32 @@ def main() -> None:
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        log_fn=log,
-    )
+    if TTT_ENABLED:
+        q_val_loss, q_val_bpb = eval_val_ttt(
+            args,
+            model,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+    log(
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"ttt:{TTT_ENABLED} prefix:{TTT_PREFIX_TOKENS} steps:{TTT_STEPS} lr:{TTT_LR} "
+        f"eval_seq_len:{args.eval_seq_len} eval_time:{q_eval_ms:.0f}ms"
+    )
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
