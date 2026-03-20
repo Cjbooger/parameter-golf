@@ -87,6 +87,54 @@ python3 train_gpt_mlx.py
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
 
+For local Mac iteration, the MLX script now supports three useful final-eval modes. Periodic validation during training intentionally stays simple; the score that matters is the final `final_int8_zlib_roundtrip_exact` line.
+
+Baseline final eval (non-overlapping):
+
+```bash
+RUN_ID=mlx_baseline \
+TTT_ENABLED=0 \
+EVAL_STRIDE=0 \
+ITERATIONS=200 \
+TRAIN_BATCH_TOKENS=8192 \
+VAL_LOSS_EVERY=0 \
+VAL_BATCH_SIZE=8192 \
+python3 train_gpt_mlx.py
+```
+
+Sliding-window final eval (better context per scored token):
+
+```bash
+RUN_ID=mlx_slide64 \
+TTT_ENABLED=0 \
+EVAL_SEQ_LEN=1024 \
+EVAL_STRIDE=64 \
+EVAL_BATCH_SEQS=64 \
+ITERATIONS=200 \
+TRAIN_BATCH_TOKENS=8192 \
+VAL_LOSS_EVERY=0 \
+VAL_BATCH_SIZE=8192 \
+python3 train_gpt_mlx.py
+```
+
+Leak-free control-tensor TTT final eval:
+
+```bash
+RUN_ID=mlx_ttt \
+TTT_ENABLED=1 \
+TTT_PREFIX_TOKENS=64 \
+TTT_STEPS=1 \
+TTT_LR=1e-3 \
+EVAL_SEQ_LEN=1024 \
+ITERATIONS=200 \
+TRAIN_BATCH_TOKENS=8192 \
+VAL_LOSS_EVERY=0 \
+VAL_BATCH_SIZE=8192 \
+python3 train_gpt_mlx.py
+```
+
+The script logs `final_eval_mode:standard`, `final_eval_mode:sliding_window`, or `final_eval_mode:ttt` so you can confirm which path actually ran.
+
 ### Scaling Up to a Remote Machine
 
 Once you're happy with your local tests, or you want more compute, switch to a remote CUDA machine.

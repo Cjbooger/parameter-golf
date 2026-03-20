@@ -58,6 +58,8 @@ class Hyperparameters:
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     eval_seq_len: int = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
+    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 0))
+    eval_batch_seqs: int = int(os.environ.get("EVAL_BATCH_SEQS", 64))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
@@ -434,6 +436,11 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
+    def forward_logits(self, input_ids: mx.array) -> mx.array:
+        x = self(input_ids)
+        logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+        return self.softcap(logits_proj)
+
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
@@ -772,30 +779,32 @@ def eval_val(
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
     log_fn: Optional[Callable[[str], None]] = None,
+    seq_len: Optional[int] = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    eval_seq_len = args.train_seq_len if seq_len is None else seq_len
     val_batch_tokens = args.val_batch_size // args.grad_accum_steps
-    if val_batch_tokens < args.train_seq_len:
+    if val_batch_tokens < eval_seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
-            f"TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"SEQ_LEN={eval_seq_len}"
         )
-    val_batch_seqs = val_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.size - 1) // args.train_seq_len
+    val_batch_seqs = max(val_batch_tokens // eval_seq_len, 1)
+    total_seqs = (val_tokens.size - 1) // eval_seq_len
     total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
     for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
+        raw_start = batch_seq_start * eval_seq_len
+        raw_end = batch_seq_end * eval_seq_len + 1
         chunk = val_tokens[raw_start:raw_end]
-        x_np = chunk[:-1].reshape(-1, args.train_seq_len)
-        y_np = chunk[1:].reshape(-1, args.train_seq_len)
+        x_np = chunk[:-1].reshape(-1, eval_seq_len)
+        y_np = chunk[1:].reshape(-1, eval_seq_len)
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
         chunk_token_count = float(y.size)
@@ -817,6 +826,78 @@ def eval_val(
     val_loss = total_loss_sum / total_tokens
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
+    return val_loss, val_bpb
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: GPT,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> tuple[float, float]:
+    seq_len = args.eval_seq_len
+    stride = args.eval_stride
+    if stride <= 0 or stride >= seq_len:
+        raise ValueError(f"EVAL_STRIDE must satisfy 0 < EVAL_STRIDE < EVAL_SEQ_LEN, got {stride} and {seq_len}")
+    if args.eval_batch_seqs <= 0:
+        raise ValueError(f"EVAL_BATCH_SEQS must be positive, got {args.eval_batch_seqs}")
+
+    total_tokens = int(val_tokens.size - 1)
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= 1
+    ]
+    total_windows = len(window_starts)
+    total_batches = max((total_windows + args.eval_batch_seqs - 1) // args.eval_batch_seqs, 1)
+
+    total_loss_sum = 0.0
+    total_token_count = 0.0
+    total_byte_count = 0.0
+    for batch_idx, batch_start in enumerate(range(0, total_windows, args.eval_batch_seqs), start=1):
+        batch_ws = window_starts[batch_start:batch_start + args.eval_batch_seqs]
+        bsz = len(batch_ws)
+        x_batch = np.zeros((bsz, seq_len), dtype=np.int32)
+        y_batch = np.zeros((bsz, seq_len), dtype=np.int32)
+        lengths: list[int] = []
+
+        for row, ws in enumerate(batch_ws):
+            end = min(ws + seq_len, total_tokens)
+            wlen = end - ws
+            lengths.append(wlen)
+            chunk = val_tokens[ws:end + 1]
+            x_batch[row, :wlen] = chunk[:-1]
+            y_batch[row, :wlen] = chunk[1:]
+
+        logits = model.forward_logits(mx.array(x_batch, dtype=mx.int32)).astype(mx.float32)
+        nll = nn.losses.cross_entropy(logits, mx.array(y_batch, dtype=mx.int32), reduction="none")
+        mx.eval(logits, nll)
+        nll_np = np.array(nll, dtype=np.float32, copy=False)
+
+        for row, ws in enumerate(batch_ws):
+            wlen = lengths[row]
+            score_start = 0 if ws == 0 else max(wlen - stride, 0)
+            scored_nll = nll_np[row, score_start:wlen].astype(np.float64, copy=False)
+            total_loss_sum += float(scored_nll.sum(dtype=np.float64))
+            total_token_count += float(wlen - score_start)
+            tgt_ids = y_batch[row, score_start:wlen]
+            prev_ids = x_batch[row, score_start:wlen]
+            bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
+            bytes_np += (
+                has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+            ).astype(np.int16, copy=False)
+            total_byte_count += float(bytes_np.astype(np.float64).sum())
+
+        if log_fn is not None and total_batches > 1 and (
+            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+        ):
+            log_fn(f"sliding_val_progress:{batch_idx}/{total_batches}")
+
+    val_loss = total_loss_sum / total_token_count
+    bits_per_token = val_loss / math.log(2.0)
+    val_bpb = bits_per_token * (total_token_count / total_byte_count)
     return val_loss, val_bpb
 
 
@@ -1100,6 +1181,7 @@ def main() -> None:
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
         f"val_batch_size:{args.val_batch_size} eval_seq_len:{args.eval_seq_len} "
+        f"eval_stride:{args.eval_stride} eval_batch_seqs:{args.eval_batch_seqs} "
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
@@ -1247,6 +1329,7 @@ def main() -> None:
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     if TTT_ENABLED:
+        final_eval_mode = "ttt"
         q_val_loss, q_val_bpb = eval_val_ttt(
             args,
             model,
@@ -1256,7 +1339,19 @@ def main() -> None:
             has_leading_space_lut,
             is_boundary_token_lut,
         )
+    elif 0 < args.eval_stride < args.eval_seq_len:
+        final_eval_mode = "sliding_window"
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args,
+            model,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
     else:
+        final_eval_mode = "standard"
         q_val_loss, q_val_bpb = eval_val(
             args,
             compiled_loss,
@@ -1265,12 +1360,14 @@ def main() -> None:
             has_leading_space_lut,
             is_boundary_token_lut,
             log_fn=log,
+            seq_len=args.eval_seq_len,
         )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
+    log(f"final_eval_mode:{final_eval_mode}")
     log(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"ttt:{TTT_ENABLED} prefix:{TTT_PREFIX_TOKENS} steps:{TTT_STEPS} lr:{TTT_LR} "
-        f"eval_seq_len:{args.eval_seq_len} eval_time:{q_eval_ms:.0f}ms"
+        f"eval_seq_len:{args.eval_seq_len} eval_stride:{args.eval_stride} eval_time:{q_eval_ms:.0f}ms"
     )
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
