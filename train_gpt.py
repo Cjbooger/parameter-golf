@@ -288,7 +288,7 @@ TTT_ENABLED = bool(int(os.environ.get("TTT_ENABLED", "1")))
 
 
 def find_document_boundaries(val_tokens: Tensor, is_boundary_lut: Tensor) -> list[tuple[int, int]]:
-    boundary_mask = is_boundary_lut.to(device=val_tokens.device)[val_tokens]
+    boundary_mask = is_boundary_lut.to(device=val_tokens.device)[val_tokens.to(dtype=torch.int64)]
     boundary_positions = boundary_mask.nonzero(as_tuple=True)[0].tolist()
     if not boundary_positions:
         return [(0, len(val_tokens))]
